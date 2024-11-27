@@ -2,7 +2,6 @@ import random
 from textwrap import dedent
 import torch
 from transformers import (
-    AutoModelForCausalLM,
     AutoTokenizer
 )
 import numpy as np
@@ -63,3 +62,10 @@ def quadratic(x, a, b, c):
 
 def linear(x, a, b):
     return a * x + b
+
+
+def get_profile_penalty(penalty: str):
+    if penalty in ["quadratic"]:
+        return lambda f, T: np.sum(np.maximum(np.array(f) - np.array(T), 0)**2)
+    else:
+        raise NotImplementedError("Only quadratic penalty function is supported for now") # will be updated later

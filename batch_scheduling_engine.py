@@ -1,14 +1,15 @@
 import torch
 import json
+import os
 import asyncio
 import numpy as np
 import cvxpy as cp
-from datetime import datetime, timedelta
+from datetime import datetime
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from utils import format_example, count_tokens, prepare_dataset_for_speed_eval, seed_everything, quadratic, linear
+from utils import format_example, count_tokens, prepare_dataset_for_speed_eval, seed_everything, quadratic, linear, get_profile_penalty
 
 class BatchSchedulingEngine:
-    def __init__(self, model_name, batch_size=4, seed=42, pad_token="<|pad|>", strategy="OPTIMAL", max_new_tokens=50, 
+    def __init__(self, model_name="meta-llama/Llama-3.1-8B-Instruct", batch_size=4, seed=42, pad_token="<|pad|>", strategy="OPTIMAL", max_new_tokens=50, 
                  requests: dict={}, slo_list: list=[], penalty="quadratic"):
         seed_everything(seed)
         tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
@@ -46,14 +47,19 @@ class BatchSchedulingEngine:
             
         self.prefill_latency_pred = []
         self.decode_latency_pred = []
+        self.process_time_pred = [] # prefill + decode, expected
+        self.actual_process_time = [] # actual process time
         self.run_profile()
         
         self.slo_list = slo_list # should be represented in seconds (not ms)
+        self.profile_penalty = get_profile_penalty(penalty)
         if penalty in ["quadratic"]:
             self.penalty = penalty
         else:
             raise NotImplementedError("Only quadratic penalty function is supported for now")
+        
         self.running_order = self.generate_schedule()
+        self.add_items_to_queue()
             
         
     def register_requests(self, questions: dict):
@@ -65,7 +71,7 @@ class BatchSchedulingEngine:
     
     def run_profile(self):
         prefill_latencies_pred = quadratic(np.array(self.dataset_lengths_in_tokens), *self.prefill_params).tolist()
-        decoding_latencies_pred = [item * self.max_new_tokens for item in linear(np.array(self.dataset_lengths_in_tokens), *self.decode_params).tolist()]
+        decoding_latencies_pred = [item * (self.max_new_tokens - 1) for item in linear(np.array(self.dataset_lengths_in_tokens), *self.decode_params).tolist()]
         
         # convert to seconds
         prefill_latencies_pred = [item/1000 for item in prefill_latencies_pred]
@@ -76,8 +82,10 @@ class BatchSchedulingEngine:
     
         
     def generate_schedule(self) -> list[int]:
-        if self.strategy == "OPTIMAL":
-            process_time = np.array([sum(item) for item in zip(self.prefill_latency_pred, self.decode_latency_pred)])
+        self.process_time_pred.extend([sum(item) for item in zip(self.prefill_latency_pred, self.decode_latency_pred)])
+        
+        if self.strategy == "OPTIMAL": #MILP problem
+            process_time = np.array(self.process_time_pred)
             T = np.array(self.slo_list)
             
             n = len(self.datasets)
@@ -114,8 +122,7 @@ class BatchSchedulingEngine:
             return np.random.permutation(self.num_requests).tolist()
         
         elif self.strategy == "SRTF":
-            process_time = [sum(item) for item in zip(self.prefill_latency_pred, self.decode_latency_pred)]
-            return np.argsort(process_time).tolist()
+            return np.argsort(self.process_time_pred).tolist()
         
         elif self.strategy == "FIFO":
             return list(range(self.num_requests))
@@ -123,12 +130,42 @@ class BatchSchedulingEngine:
         else:
             raise ValueError("Invalid scheduling strategy")
         
+        
     def add_items_to_queue(self):
         for data in self.datasets:
             asyncio.get_event_loop().call_soon_threadsafe(self.data_queue.put_nowait, data)
+            
+            
+    def analyze_and_record(self):
+        log_dir_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "log")
+        log_file_path = os.path.join(log_dir_path, f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}")
+        os.makedirs(log_dir_path, exist_ok=True)
+        
+        slo_violation = self.profile_penalty(self.actual_process_time, self.slo_list)
+        
+        log_results = {
+            "predicted_latencies": self.process_time_pred,
+            "actual_latencies": self.actual_process_time,
+            "slo_list": self.slo_list,
+            "running_order": self.running_order,
+            "slo_violation": slo_violation,
+            "strategy": self.strategy,
+        }
+        
+        with open(log_file_path, "w") as f:
+            json.dump(log_results, f, indent=4)
+        
         
     async def llm_inference(self, data):
-        pass
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Evennt(enable_timing=True)
+        start.record()
+        outputs = self.model.generate(**data, max_new_tokens = self.max_new_tokens)
+        end.record()
+        torch.cuda.synchronize()
+        self.actual_process_time.append(start.elapsed_time(end) / 1000) # convert to seconds
+        
     
     async def process_queue(self):
         WARMUP_STEP = 50
