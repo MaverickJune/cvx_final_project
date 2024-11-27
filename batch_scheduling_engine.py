@@ -112,11 +112,15 @@ class BatchSchedulingEngine:
             return [index for index, value in sorted(enumerate(expected_start_times), key=lambda x: x[1])]
         
         elif self.strategy == "RANDOM":
-            pass
+            return np.random.permutation(self.num_requests).tolist()
+        
         elif self.strategy == "SRTF":
-            pass
+            process_time = [sum(item) for item in zip(self.prefill_latency_pred, self.decode_latency_pred)]
+            return np.argsort(process_time).tolist()
+        
         elif self.strategy == "FIFO":
-            pass
+            return list(range(self.num_requests))
+        
         else:
             raise ValueError("Invalid scheduling strategy")
         
