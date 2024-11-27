@@ -3,7 +3,6 @@ import json
 import asyncio
 import numpy as np
 import cvxpy as cp
-from queue import Queue
 from datetime import datetime, timedelta
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from utils import format_example, count_tokens, prepare_dataset_for_speed_eval, seed_everything, quadratic, linear
@@ -31,7 +30,7 @@ class BatchSchedulingEngine:
         self.datasets = []
         self.dataset_lengths_in_tokens = []
         self.num_requests = len(requests)
-        self.run_queue = Queue()
+        self.data_queue = asyncio.Queue()
         self.processing = False # ?
         self.register_requests(requests)
         self.max_new_tokens = max_new_tokens
@@ -54,7 +53,7 @@ class BatchSchedulingEngine:
             self.penalty = penalty
         else:
             raise NotImplementedError("Only quadratic penalty function is supported for now")
-        self.generate_schedule()
+        self.running_order = self.generate_schedule()
             
         
     def register_requests(self, questions: dict):
@@ -124,3 +123,37 @@ class BatchSchedulingEngine:
         else:
             raise ValueError("Invalid scheduling strategy")
         
+    def add_items_to_queue(self):
+        for data in self.datasets:
+            asyncio.get_event_loop().call_soon_threadsafe(self.data_queue.put_nowait, data)
+        
+    async def llm_inference(self, data):
+        pass
+    
+    async def process_queue(self):
+        WARMUP_STEP = 50
+        
+        # warmup
+        print("Warming up...")
+        warmup_data = self.datasets[0]
+        torch.cuda.synchronize()
+        for _ in range(WARMUP_STEP):
+            await self.llm_inference(warmup_data)
+        torch.cuda.synchronize()
+        print("Warming up done \n")
+        
+        self.processing = True
+        print("Processing queue...")
+        while True:
+            try:
+                data = await asyncio.wait_for(self.data_queue.get(), timeout=1)
+                await self.llm_inference(data)
+                self.data_queue.task_done()
+                
+            except asyncio.TimeoutError:
+                if self.data_queue.empty():
+                    self.processing = False
+                    break
+        print("Processing done")
+        
+    
